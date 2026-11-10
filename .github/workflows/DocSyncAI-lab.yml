@@ -1,0 +1,199 @@
+name: DocSync AI Lab - Gate Replica
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRUCTURAL REPLICA — authorized bug bounty lab (Deriv H1 program, task T4).
+#
+# This workflow replicates the gating structure of
+#   deriv-com/deriv-smartcharts/.github/workflows/DocSyncAI.yml (lines 3-8, 37-57)
+#   -> deriv-com/shared-actions/.github/workflows/docsync-ai.yml (update-from-comment)
+#   -> deriv-com/shared-actions/.github/actions/docsync_ai_comment (steps 1,3,4,5,8)
+# flattened into one file. The replicated failure mode: an issue_comment trigger
+# whose ONLY gate is a body-prefix check (`startsWith(..., '@docbot')`) plus
+# "the comment is on a PR" — NO actor/authorization gate at any layer — driving
+# a job that holds a repo-write credential (LAB_DOCSYNC_TOKEN, a fine-grained
+# PAT with Contents+PullRequests write on THIS repo only) and pushes commits.
+#
+# Differences from the Deriv chain (all listed in notes/lab-docsync-poc.md):
+#   - the Anthropic API "instruction -> new README content" step is replaced by
+#     a deterministic append of the sanitized instruction (same data flow:
+#     comment text -> committed file content -> git push);
+#   - no Slack/metrics side effects; no reusable-workflow hop (adds no gate).
+# This repo contains no Deriv code and calls no Deriv infrastructure.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  docsync-comment:
+    # ── EXACT GATE REPLICA of deriv-smartcharts/DocSyncAI.yml:38-41 ──
+    # (issue_comment + on-a-PR + prefix check. No actor check anywhere.)
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '@docbot')
+    # ── permission replica of DocSyncAI.yml:42-44 (contents + pull-requests write) ──
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      # Replica of docsync_ai_comment STEP 1 (Parse Command). Same env-var
+      # handoff pattern as the real chain: comment body reaches run: ONLY as
+      # "$COMMENT_BODY" — never interpolated directly.
+      - name: Parse Command
+        id: parse-command
+        shell: bash
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          # In-run proof of who GitHub says the commenter is (echoed via env,
+          # same safe pattern). author_association NONE = no special privileges.
+          COMMENT_LOGIN: ${{ github.event.comment.user.login }}
+          COMMENT_ASSOC: ${{ github.event.comment.author_association }}
+        run: |
+          set -e
+          echo "commenter_login=$COMMENT_LOGIN author_association=$COMMENT_ASSOC" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          COMMENT_BODY_CLEAN=$(echo "$COMMENT_BODY" | tr -d '\000' | iconv -c -t UTF-8//IGNORE | head -c 10000)
+
+          FIRST_LINE=$(echo "$COMMENT_BODY_CLEAN" | head -1)
+          if ! echo "$FIRST_LINE" | grep -qiE "^@docbot([[:space:]]|$)"; then
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            echo "command=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+
+          INSTRUCTION=$(echo "$COMMENT_BODY_CLEAN" | sed -E '1s/^@[Dd][Oo][Cc][Bb][Oo][Tt][[:space:]]*//')
+          INSTRUCTION=$(echo "$INSTRUCTION" | sed '/./,$!d')
+          INSTRUCTION_LOWER=$(echo "$INSTRUCTION" | tr '[:upper:]' '[:lower:]' | head -1)
+
+          if echo "$INSTRUCTION_LOWER" | grep -qE "^revert[[:space:]]+last[[:space:]]+change[s]?[[:space:]]*$"; then
+            echo "command=revert_last" >> "$GITHUB_OUTPUT"
+            echo "target_file=all" >> "$GITHUB_OUTPUT"
+          else
+            echo "command=update" >> "$GITHUB_OUTPUT"
+            echo "target_file=readme" >> "$GITHUB_OUTPUT"
+            {
+              echo "suggestion<<EOF"
+              echo "$INSTRUCTION"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # Replica of docsync_ai_comment STEP 3 (Verify PR Type): PR branch is
+      # fetched with the bot token and validated to the same charset.
+      - name: Verify PR Type
+        id: verify-pr
+        if: steps.parse-command.outputs.valid == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LAB_DOCSYNC_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          set -e
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then exit 1; fi
+          PR_DATA=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO_NAME/pulls/$PR_NUMBER")
+          PR_BRANCH=$(echo "$PR_DATA" | jq -r '.head.ref')
+          if ! [[ "$PR_BRANCH" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+            echo "Invalid branch name format: $PR_BRANCH"
+            exit 1
+          fi
+          echo "pr_branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
+
+      # Replica of docsync_ai_comment STEP 4 (Checkout PR Branch) — checkout
+      # with the bot PAT so the later `git push` authenticates with it,
+      # exactly like the real chain.
+      - name: Checkout PR Branch
+        if: steps.parse-command.outputs.valid == 'true'
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v4
+        with:
+          token: ${{ secrets.LAB_DOCSYNC_TOKEN }}
+          ref: ${{ steps.verify-pr.outputs.pr_branch }}
+          fetch-depth: 0
+
+      # Lab substitute for the real chain's Anthropic API step
+      # (docsync_ai_comment STEP 7): same data flow, deterministic content.
+      - name: Apply Instruction (deterministic substitute for the Anthropic call)
+        id: apply
+        if: steps.parse-command.outputs.valid == 'true' && steps.parse-command.outputs.command == 'update'
+        shell: bash
+        env:
+          SUGGESTION: ${{ steps.parse-command.outputs.suggestion }}
+        run: |
+          set -e
+          SUGGESTION_CLEAN=$(echo "$SUGGESTION" | tr -d '\000' | iconv -c -t UTF-8//IGNORE | head -c 2000)
+          printf '\n> [!NOTE]\n> DocSync lab instruction applied: %s\n' "$(echo "$SUGGESTION_CLEAN" | head -1)" >> README.md
+
+      # Replica of docsync_ai_comment STEP 5 (revert path) — the second
+      # command grammar that reaches `git push origin HEAD`.
+      - name: Handle Revert Last Change
+        id: revert-changes
+        if: steps.parse-command.outputs.valid == 'true' && steps.parse-command.outputs.command == 'revert_last'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LAB_DOCSYNC_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -e
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          LAST_LAB_COMMIT=$(git log --author="github-actions\[bot\]" --grep="DocSync AI Lab" --format="%H" -1 2>/dev/null || echo "")
+          if [ -z "$LAST_LAB_COMMIT" ]; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git revert --no-edit "$LAST_LAB_COMMIT"
+          git push origin HEAD
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      # Replica of docsync_ai_comment STEP 8 (Commit Changes to PR): the
+      # README-only guard, then `git push origin HEAD` with the bot PAT.
+      - name: Commit Changes to PR
+        id: commit-changes
+        if: steps.parse-command.outputs.valid == 'true' && steps.parse-command.outputs.command == 'update'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LAB_DOCSYNC_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -e
+          git add -A
+          if git diff --cached --quiet; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --cached --name-only)
+          INVALID_FILES=""
+          for file in $CHANGED; do
+            FILE_LOWER=$(echo "$file" | tr '[:upper:]' '[:lower:]')
+            if [[ "$FILE_LOWER" != "readme.md" ]]; then
+              INVALID_FILES="$INVALID_FILES $file"
+            fi
+          done
+          if [ -n "$INVALID_FILES" ]; then
+            echo "ERROR: Non-documentation files were modified:$INVALID_FILES"
+            git reset --hard
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "DocSync AI Lab: Update README.md from @docbot command"
+          git push origin HEAD
+
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          gh pr comment "$PR_NUMBER" --body "**DocSync AI Lab — Update Applied** ✅
+
+          Your documentation instruction has been applied and committed ($COMMIT_HASH).
+
+          ---
+          *Automated by the DocSync gate-replica lab*"
