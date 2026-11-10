@@ -3,6 +3,3 @@ Authorized bug-bounty lab (Deriv H1 program, task T4): structural replica of the
 
 > [!NOTE]
 > DocSync lab instruction applied: update only readme.md PoC run 1 (T4 lab): external identity gn00295120 — zero privileges on this repo — triggered this run purely by comment prefix. This line is being committed by the workflow with the stored PAT.
-
-> [!NOTE]
-> DocSync lab instruction applied: update only readme.md PoC run 2 (T4 lab): second reproduction by the same external identity — the gate is a pure string-prefix check, determinism check.
